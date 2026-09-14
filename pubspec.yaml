@@ -1,0 +1,36 @@
+﻿name: huainian
+description: "怀念 - 虚拟人物情感陪伴对话软件（云端大模型驱动，数据本地存储）"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  
+  # 本地关系型数据库
+  sqflite: ^2.3.3+1
+  # 路径管理工具
+  path: ^1.9.0
+  # 本地应用沙盒路径获取
+  path_provider: ^2.1.3
+  # 本地 HTTP 通信（对接 Ollama）
+  http: ^1.2.1
+  # 状态管理（官方推荐）
+  flutter_riverpod: ^2.5.1
+  # 追加文件选择器插件
+  file_picker: ^8.0.3
+  # 后台定时任务（阶段三 F-013 主动消息调度）
+  workmanager: ^0.9.0+3
+  # 本地推送通知（阶段三 F-014 消息通知）
+  flutter_local_notifications: ^17.2.4
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
