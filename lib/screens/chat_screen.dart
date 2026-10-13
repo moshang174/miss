@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
@@ -8,8 +9,10 @@ import 'package:huainian/database/db_helper.dart';
 import 'package:huainian/models/character_style.dart';
 import 'package:huainian/models/chat_message.dart';
 import 'package:huainian/screens/settings_screen.dart';
+import 'package:huainian/services/ambience_service.dart';
 import 'package:huainian/services/chat_service.dart';
 import 'package:huainian/services/proactive_message_service.dart';
+import 'package:huainian/state/app_providers.dart';
 
 /// V6.0 — QQ 风格聊天主界面
 /// 视觉规范：QQ 蓝顶栏 / 灰蓝背景 / 左侧白色气泡 + 右侧浅蓝气泡（带尾巴）
@@ -49,6 +52,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
   bool get _isSleeping => ChatService.isInSleepRange(_sleepStart, _sleepEnd);
 
+  /// V7.0 R4：发给大模型的上下文滑窗大小（最近 N 条 user/assistant 消息）
+  /// 控制 token 消耗，更早的历史由记忆召回机制兜底
+  static const int _contextWindowSize = 20;
+
+  /// V7.0 R4：最近一次发送失败的用户输入（供错误气泡点按重发）
+  String? _lastFailedInput;
+
   @override
   void initState() {
     super.initState();
@@ -57,6 +67,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       await _loadConversation();
       await _requestNotificationPermission();
+      // V7.0：同步背景音乐播放状态（配置为开启时进入聊天即播放）
+      AmbienceService.instance.syncPlayback();
     });
   }
 
@@ -92,6 +104,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       _loadError = null;
     });
     try {
+      // V7.0：同步读取聊天背景图配置
+      final bgPath = await AmbienceService.instance.getChatBackgroundPath();
+      if (mounted) {
+        ref.read(chatBackgroundProvider.notifier).state = bgPath ?? '';
+      }
+
       final config = await DbHelper.instance.getCharacterConfig();
       if (!mounted) return;
       if (config == null) {
@@ -195,8 +213,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
   // ── 发送消息 ───────────────────────────────────────────────────────────────
 
-  Future<void> _sendMessage() async {
-    final text = _inputController.text.trim();
+  Future<void> _sendMessage({String? retryOf}) async {
+    final bool isRetry = retryOf != null;
+    final text = (retryOf ?? _inputController.text).trim();
     if (text.isEmpty || _isSending) return;
 
     // 输入长度校验
@@ -206,12 +225,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     }
 
     _cancelTypewriter(snapToFull: true);
-    _inputController.clear();
+    if (!isRetry) _inputController.clear();
 
     final now = DateTime.now();
 
-    // ── 睡眠拦截 ───────────────────────────────────────────────────────────
-    if (_isSleeping) {
+    // ── 睡眠拦截（重试场景不会出现：睡眠时消息留待醒来，不产生错误气泡）─────
+    if (!isRetry && _isSleeping) {
       final userMsg =
           ChatMessage(role: MessageRole.user, content: text, timestamp: now);
       final notice = ChatMessage(
@@ -232,27 +251,38 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       return;
     }
 
-    // ── 构建上下文（只含 user/assistant 角色）─────────────────────────────
-    final List<Map<String, String>> context = [];
+    // ── 构建上下文（只含 user/assistant 角色，V7.0 R4 限最近 N 条滑窗）─────
+    final List<Map<String, String>> history = [];
     for (final m in _messages) {
       if (m.isUser) {
-        context.add({'role': 'user', 'content': m.content});
-      } else if (m.isAssistant) {
-        context.add({'role': 'assistant', 'content': m.content});
+        history.add({'role': 'user', 'content': m.content});
+      } else if (m.isAssistant &&
+          !_isErrorContent(m.content) &&
+          m.content != '···') {
+        // 错误气泡与占位符不进入上下文，避免污染对话
+        history.add({'role': 'assistant', 'content': m.content});
       }
     }
-    context.add({'role': 'user', 'content': text});
+    // 重试时用户消息已在历史末尾（首轮已上屏入库），不重复追加
+    if (!isRetry) {
+      history.add({'role': 'user', 'content': text});
+    }
+    final List<Map<String, String>> context =
+        history.length > _contextWindowSize
+            ? history.sublist(history.length - _contextWindowSize)
+            : history;
 
-    // ── 立即将用户消息和占位符写入 UI ───────────────────────────────────
-    final userMsg =
-        ChatMessage(role: MessageRole.user, content: text, timestamp: now);
+    // ── 立即将用户消息和占位符写入 UI（重试时用户消息已存在，只加占位符）───
     final placeholder = ChatMessage(
       role: MessageRole.assistant,
       content: '···',
       timestamp: now,
     );
     setState(() {
-      _messages.add(userMsg);
+      if (!isRetry) {
+        _messages.add(ChatMessage(
+            role: MessageRole.user, content: text, timestamp: now));
+      }
       _messages.add(placeholder);
       _isSending = true;
     });
@@ -260,7 +290,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     _scrollToBottom();
 
     try {
-      await DbHelper.instance.insertMessage('user', text);
+      // 重试时用户消息首轮已写入回忆录，不重复入库
+      if (!isRetry) {
+        await DbHelper.instance.insertMessage('user', text);
+      }
 
       final reply = await _chatService.sendChatMessage(context);
       if (!mounted) return;
@@ -268,11 +301,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       final recalled = List<String>.from(_chatService.lastRecalledFacts);
 
       // 错误回复（通讯中断/密钥未配置等）只上屏展示，不写入回忆录，
-      // 防止污染后续记忆提炼的语料
-      final bool isErrorReply =
-          reply.startsWith('错误：') || reply.startsWith('异常：');
+      // 防止污染后续记忆提炼的语料；同时记录失败输入供点按重发
+      final bool isErrorReply = _isErrorContent(reply);
       if (!isErrorReply) {
         await DbHelper.instance.insertMessage('assistant', reply);
+        _lastFailedInput = null;
+      } else {
+        _lastFailedInput = text;
       }
 
       if (!mounted) return;
@@ -292,6 +327,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       _scrollToBottom();
     } catch (e) {
       if (!mounted) return;
+      _lastFailedInput = text;
       final errText =
           '通讯中断: ${e.toString().replaceAll('Exception:', '').trim()}';
       setState(() {
@@ -302,6 +338,26 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         _isSending = false;
       });
     }
+  }
+
+  /// 错误类回复判定（错误/异常前缀的 API 失败 + 本地通讯中断占位）
+  static bool _isErrorContent(String content) =>
+      content.startsWith('错误：') ||
+      content.startsWith('异常：') ||
+      content.startsWith('通讯中断');
+
+  /// V7.0 R4：点按错误气泡重发——移除错误气泡后以原输入重新走发送流程
+  void _retryFailedMessage(ChatMessage errorMsg) {
+    final failedInput = _lastFailedInput;
+    if (failedInput == null || _isSending) return;
+    // 先停掉可能正在播放的错误文本打字机，防止移除气泡后索引位移、
+    // Timer 将错误文本写进相邻消息
+    _cancelTypewriter(snapToFull: false);
+    setState(() {
+      _messages.remove(errorMsg);
+      _lastFailedInput = null;
+    });
+    _sendMessage(retryOf: failedInput);
   }
 
   // ── 打字机效果 ─────────────────────────────────────────────────────────────
@@ -476,6 +532,14 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       MaterialPageRoute(builder: (_) => const SettingsScreen()),
     );
     if (!mounted) return;
+    // V7.0：设置页可能变更了背景图/音乐，返回后无条件刷新氛围配置
+    try {
+      final bgPath = await AmbienceService.instance.getChatBackgroundPath();
+      if (mounted) {
+        ref.read(chatBackgroundProvider.notifier).state = bgPath ?? '';
+      }
+      AmbienceService.instance.syncPlayback();
+    } catch (_) {}
     try {
       final config = await DbHelper.instance.getCharacterConfig();
       if (!mounted) return;
@@ -500,14 +564,33 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
   @override
   Widget build(BuildContext context) {
+    final String bgPath = ref.watch(chatBackgroundProvider) ?? '';
+    final bool hasBg = bgPath.isNotEmpty; // 文件缺失时由 errorBuilder 兜底
     return Scaffold(
       backgroundColor: _bgColor,
       appBar: _buildAppBar(),
-      body: Column(
+      body: Stack(
         children: [
-          Expanded(child: _buildBody()),
-          if (_isSleeping) _buildSleepBanner(),
-          _buildInputRow(),
+          // V7.0：用户自定义聊天背景图 + 可读性柔光遮罩
+          if (hasBg) ...[
+            Positioned.fill(
+              child: Image.file(
+                File(bgPath),
+                fit: BoxFit.cover,
+                errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+              ),
+            ),
+            Positioned.fill(
+              child: Container(color: _bgColor.withValues(alpha: 0.55)),
+            ),
+          ],
+          Column(
+            children: [
+              Expanded(child: _buildBody()),
+              if (_isSleeping) _buildSleepBanner(),
+              _buildInputRow(),
+            ],
+          ),
         ],
       ),
     );
@@ -678,9 +761,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     );
   }
 
-  /// QQ 风格对方气泡：左侧，白底 + 左向尾巴
+  /// QQ 风格对方气泡：左侧，白底 + 左向尾巴；错误气泡红色文案 + 点按重发
   Widget _buildAssistantBubble(ChatMessage msg) {
     final initial = (_characterName.isNotEmpty) ? _characterName[0] : 'T';
+    final bool isError = _isErrorContent(msg.content);
     return Padding(
       padding: const EdgeInsets.only(bottom: 12),
       child: Row(
@@ -692,6 +776,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           Flexible(
             child: GestureDetector(
               onLongPress: () => _copyMessage(msg.content),
+              onTap: isError ? () => _retryFailedMessage(msg) : null,
               child: CustomPaint(
                 painter: const _BubbleTailPainter(
                   color: _assistantBubbleColor,
@@ -701,10 +786,31 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                   margin: const EdgeInsets.only(left: 7),
                   padding: const EdgeInsets.symmetric(
                       horizontal: 12, vertical: 10),
-                  child: Text(
-                    msg.content,
-                    style: const TextStyle(
-                        fontSize: 15, color: Colors.black87, height: 1.35),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        msg.content,
+                        style: TextStyle(
+                          fontSize: 15,
+                          color: isError
+                              ? Colors.red.shade700
+                              : Colors.black87,
+                          height: 1.35,
+                        ),
+                      ),
+                      if (isError) ...[
+                        const SizedBox(height: 4),
+                        Text(
+                          '点按重发',
+                          style: TextStyle(
+                            fontSize: 11,
+                            color: _qqBlue.withValues(alpha: 0.8),
+                          ),
+                        ),
+                      ],
+                    ],
                   ),
                 ),
               ),

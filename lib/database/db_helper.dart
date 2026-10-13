@@ -158,6 +158,18 @@ class DbHelper {
     return rows.reversed.toList();
   }
 
+  /// 更新角色休眠时段（V7.0 R3：用户自定义）
+  /// [start] / [end] 格式 "HH:MM"，支持跨午夜（如 23:00 → 06:00）
+  Future<void> updateSleepRange(String start, String end) async {
+    final db = await database;
+    await db.update(
+      'character_config',
+      {'sleep_start': start, 'sleep_end': end},
+      where: 'id = ?',
+      whereArgs: [1],
+    );
+  }
+
   /// 完美契合 main.dart 传入的双参数格式
   Future<int> insertMessage(String role, String content) async {
     final db = await database;
@@ -215,6 +227,12 @@ class DbHelper {
   Future<void> clearMemoryFacts() async {
     final db = await database;
     await db.delete('memory_facts');
+  }
+
+  /// 删除单条事实碎片（V7.0 R4：用户可清除错误记忆）
+  Future<void> deleteMemoryFact(int id) async {
+    final db = await database;
+    await db.delete('memory_facts', where: 'id = ?', whereArgs: [id]);
   }
 
   // =========================================================================

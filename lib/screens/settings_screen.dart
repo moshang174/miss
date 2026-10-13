@@ -1,7 +1,10 @@
+import 'dart:io';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:huainian/config/constants.dart';
 import 'package:huainian/database/db_helper.dart';
+import 'package:huainian/services/ambience_service.dart';
 import 'package:huainian/services/llm_api_service.dart';
 import 'package:huainian/state/app_providers.dart';
 
@@ -24,6 +27,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   bool _isResetting = false;
 
   // ── 连接配置（API）状态 ──────────────────────────────────────────────────
+  String _apiProvider = AppConstants.providerFree;
   final TextEditingController _baseUrlController = TextEditingController();
   final TextEditingController _apiKeyController = TextEditingController();
   final TextEditingController _modelController = TextEditingController();
@@ -33,12 +37,21 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   String? _apiTestResult;
   bool _apiTestSuccess = false;
 
+  // ── 氛围设置状态（V7.0）──────────────────────────────────────────────────
+  String _bgImagePath = '';
+  String _bgmPath = '';
+  bool _bgmEnabled = false;
+  double _bgmVolume = 0.5;
+  bool _isPickingBg = false;
+  bool _isPickingBgm = false;
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _loadCharacterInfo();
       _loadApiConfig();
+      _loadAmbienceConfig();
     });
   }
 
@@ -69,11 +82,13 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   Future<void> _loadApiConfig() async {
     try {
       final db = DbHelper.instance;
+      final provider = await db.getSetting(AppConstants.keyApiProvider);
       final baseUrl = await db.getSetting(AppConstants.keyApiBaseUrl);
       final apiKey = await db.getSetting(AppConstants.keyApiKey);
       final model = await db.getSetting(AppConstants.keyModelName);
       if (!mounted) return;
       setState(() {
+        _apiProvider = provider ?? AppConstants.providerFree;
         _baseUrlController.text = (baseUrl != null && baseUrl.isNotEmpty)
             ? baseUrl
             : AppConstants.defaultApiBaseUrl;
@@ -89,6 +104,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
 
   Future<void> _saveApiConfig({bool silent = false}) async {
     final db = DbHelper.instance;
+    await db.setSetting(AppConstants.keyApiProvider, _apiProvider);
     await db.setSetting(
         AppConstants.keyApiBaseUrl, _baseUrlController.text.trim());
     await db.setSetting(
@@ -105,8 +121,9 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     }
   }
 
-  /// 配置合法性预检：地址必须为 http(s)，模型名必填
+  /// 配置合法性预检：免费通道无需校验；高级通道地址必须为 http(s)，模型名必填
   String? _validateConfigInput() {
+    if (_apiProvider == AppConstants.providerFree) return null;
     final baseUrl = _baseUrlController.text.trim();
     if (!baseUrl.startsWith('http://') && !baseUrl.startsWith('https://')) {
       return '服务地址必须以 http:// 或 https:// 开头';
@@ -233,6 +250,159 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     }
   }
 
+  // ── 睡眠时段自定义（V7.0 R3）──────────────────────────────────────────────
+
+  Future<void> _editSleepRange() async {
+    TimeOfDay parseTime(String s) {
+      final parts = s.split(':');
+      return TimeOfDay(
+          hour: int.tryParse(parts[0]) ?? 23,
+          minute: int.tryParse(parts.length > 1 ? parts[1] : '0') ?? 0);
+    }
+
+    String fmt(TimeOfDay t) =>
+        '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
+
+    final start = await showTimePicker(
+      context: context,
+      initialTime: parseTime(_sleepStart),
+      helpText: 'TA 何时入睡',
+    );
+    if (start == null || !mounted) return;
+
+    final end = await showTimePicker(
+      context: context,
+      initialTime: parseTime(_sleepEnd),
+      helpText: 'TA 何时醒来',
+    );
+    if (end == null || !mounted) return;
+
+    final newStart = fmt(start);
+    final newEnd = fmt(end);
+    if (newStart == newEnd) {
+      _showSnack('入睡与醒来时间不能相同', isError: true);
+      return;
+    }
+
+    try {
+      await DbHelper.instance.updateSleepRange(newStart, newEnd);
+      if (!mounted) return;
+      setState(() {
+        _sleepStart = newStart;
+        _sleepEnd = newEnd;
+      });
+      _showSnack('休息时段已更新为 $newStart – $newEnd');
+    } catch (e) {
+      if (mounted) _showSnack('保存失败: $e', isError: true);
+    }
+  }
+
+  // ── 氛围设置（V7.0）───────────────────────────────────────────────────────
+
+  Future<void> _loadAmbienceConfig() async {
+    try {
+      final svc = AmbienceService.instance;
+      final bg = await svc.getChatBackgroundPath();
+      final bgm = await svc.getBgmPath();
+      final enabled = await svc.isBgmEnabled();
+      final volume = await svc.getBgmVolume();
+      if (!mounted) return;
+      setState(() {
+        _bgImagePath = bg ?? '';
+        _bgmPath = bgm ?? '';
+        _bgmEnabled = enabled;
+        _bgmVolume = volume;
+      });
+    } catch (_) {}
+  }
+
+  Future<void> _pickChatBackground() async {
+    if (_isPickingBg) return;
+    setState(() => _isPickingBg = true);
+    try {
+      final result = await FilePicker.platform.pickFiles(type: FileType.image);
+      if (result == null || result.files.isEmpty) return;
+      final path = result.files.first.path;
+      if (path == null) return;
+      final saved = await AmbienceService.instance.setChatBackground(path);
+      if (!mounted) return;
+      setState(() => _bgImagePath = saved);
+      ref.read(chatBackgroundProvider.notifier).state = saved;
+      _showSnack('背景已更新');
+    } catch (e) {
+      if (mounted) _showSnack('背景设置失败: $e', isError: true);
+    } finally {
+      if (mounted) setState(() => _isPickingBg = false);
+    }
+  }
+
+  Future<void> _clearChatBackground() async {
+    try {
+      await AmbienceService.instance.clearChatBackground();
+      if (!mounted) return;
+      setState(() => _bgImagePath = '');
+      ref.read(chatBackgroundProvider.notifier).state = '';
+      _showSnack('背景已恢复默认');
+    } catch (e) {
+      if (mounted) _showSnack('操作失败: $e', isError: true);
+    }
+  }
+
+  Future<void> _pickBgm() async {
+    if (_isPickingBgm) return;
+    setState(() => _isPickingBgm = true);
+    try {
+      final result = await FilePicker.platform.pickFiles(type: FileType.audio);
+      if (result == null || result.files.isEmpty) return;
+      final path = result.files.first.path;
+      if (path == null) return;
+      final saved = await AmbienceService.instance.setBgm(path);
+      if (!mounted) return;
+      setState(() {
+        _bgmPath = saved;
+        _bgmEnabled = true;
+      });
+      _showSnack('背景音乐已更新');
+    } catch (e) {
+      if (mounted) _showSnack('音乐设置失败: $e', isError: true);
+    } finally {
+      if (mounted) setState(() => _isPickingBgm = false);
+    }
+  }
+
+  Future<void> _clearBgm() async {
+    try {
+      await AmbienceService.instance.clearBgm();
+      if (!mounted) return;
+      setState(() {
+        _bgmPath = '';
+        _bgmEnabled = false;
+      });
+      _showSnack('背景音乐已移除');
+    } catch (e) {
+      if (mounted) _showSnack('操作失败: $e', isError: true);
+    }
+  }
+
+  Future<void> _toggleBgm(bool enabled) async {
+    setState(() => _bgmEnabled = enabled);
+    try {
+      await AmbienceService.instance.setBgmEnabled(enabled);
+      await AmbienceService.instance.syncPlayback();
+    } catch (_) {}
+  }
+
+  void _showSnack(String message, {bool isError = false}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: isError ? Colors.red : null,
+        duration: const Duration(seconds: 2),
+      ),
+    );
+  }
+
   void _showFactsDialog() {
     showDialog(
       context: context,
@@ -274,9 +444,25 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                 children: [
                   _InfoRow(label: '角色称呼', value: _characterName),
                   const Divider(height: 1),
-                  _InfoRow(
-                    label: '休息时段',
-                    value: '$_sleepStart – $_sleepEnd',
+                  // V7.0 R3：点击可自定义休息时段
+                  InkWell(
+                    onTap: _editSleepRange,
+                    borderRadius: BorderRadius.circular(6),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 2),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: _InfoRow(
+                              label: '休息时段',
+                              value: '$_sleepStart – $_sleepEnd',
+                            ),
+                          ),
+                          Icon(Icons.edit_outlined,
+                              size: 14, color: Colors.grey.shade400),
+                        ],
+                      ),
+                    ),
                   ),
                 ],
               ),
@@ -290,35 +476,74 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  _buildConfigField(
-                    controller: _baseUrlController,
-                    label: '服务地址',
-                    hint: AppConstants.defaultApiBaseUrl,
-                  ),
-                  const SizedBox(height: 10),
-                  _buildConfigField(
-                    controller: _apiKeyController,
-                    label: '连接密钥',
-                    hint: '请输入密钥',
-                    obscure: _obscureKey,
-                    suffix: IconButton(
-                      icon: Icon(
-                        _obscureKey
-                            ? Icons.visibility_off_outlined
-                            : Icons.visibility_outlined,
-                        size: 18,
-                        color: Colors.grey.shade500,
+                  // 接入方式选择：免费通道（默认）/ 高级通道
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _buildProviderOption(
+                          provider: AppConstants.providerFree,
+                          icon: Icons.bolt,
+                          label: '免费通道',
+                          subtitle: '无需密钥 · 开箱即用',
+                        ),
                       ),
-                      onPressed: () =>
-                          setState(() => _obscureKey = !_obscureKey),
-                    ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: _buildProviderOption(
+                          provider: AppConstants.providerCustom,
+                          icon: Icons.workspace_premium_outlined,
+                          label: '高级通道',
+                          subtitle: '自备密钥 · 更聪慧',
+                        ),
+                      ),
+                    ],
                   ),
                   const SizedBox(height: 10),
-                  _buildConfigField(
-                    controller: _modelController,
-                    label: '模型名称',
-                    hint: AppConstants.defaultModelName,
-                  ),
+                  if (_apiProvider == AppConstants.providerFree)
+                    Container(
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFE5F6FD),
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: Text(
+                        '当前使用免费公共通道，无需填写任何信息即可对话。'
+                        '若希望回应更稳定、更聪慧，可切换高级通道并填入自己的密钥。',
+                        style: TextStyle(
+                            fontSize: 12, color: Colors.grey.shade700),
+                      ),
+                    )
+                  else ...[
+                    _buildConfigField(
+                      controller: _baseUrlController,
+                      label: '服务地址',
+                      hint: AppConstants.defaultApiBaseUrl,
+                    ),
+                    const SizedBox(height: 10),
+                    _buildConfigField(
+                      controller: _apiKeyController,
+                      label: '连接密钥',
+                      hint: '请输入密钥',
+                      obscure: _obscureKey,
+                      suffix: IconButton(
+                        icon: Icon(
+                          _obscureKey
+                              ? Icons.visibility_off_outlined
+                              : Icons.visibility_outlined,
+                          size: 18,
+                          color: Colors.grey.shade500,
+                        ),
+                        onPressed: () =>
+                            setState(() => _obscureKey = !_obscureKey),
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    _buildConfigField(
+                      controller: _modelController,
+                      label: '模型名称',
+                      hint: AppConstants.defaultModelName,
+                    ),
+                  ],
                   if (_apiTestResult != null) ...[
                     const SizedBox(height: 10),
                     Container(
@@ -502,6 +727,157 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                 ],
               ),
             ),
+            const SizedBox(height: 12),
+
+            // ── 氛围设置（V7.0）──────────────────────────────────
+            _SectionCard(
+              title: '氛围设置',
+              titleIcon: Icons.palette_outlined,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  // 背景图
+                  Row(
+                    children: [
+                      // 缩略预览
+                      Container(
+                        width: 44,
+                        height: 44,
+                        decoration: BoxDecoration(
+                          color: _bgColor,
+                          borderRadius: BorderRadius.circular(8),
+                          image: _bgImagePath.isNotEmpty
+                              ? DecorationImage(
+                                  image: FileImage(File(_bgImagePath)),
+                                  fit: BoxFit.cover,
+                                )
+                              : null,
+                        ),
+                        child: _bgImagePath.isEmpty
+                            ? Icon(Icons.image_outlined,
+                                size: 20, color: Colors.grey.shade400)
+                            : null,
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text('聊天背景',
+                                style: TextStyle(
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w500)),
+                            Text(
+                              _bgImagePath.isEmpty ? '默认灰蓝' : '自定义图片',
+                              style: TextStyle(
+                                  fontSize: 11,
+                                  color: Colors.grey.shade500),
+                            ),
+                          ],
+                        ),
+                      ),
+                      TextButton(
+                        onPressed: _isPickingBg ? null : _pickChatBackground,
+                        child: Text(_isPickingBg ? '选取中...' : '选择图片'),
+                      ),
+                      if (_bgImagePath.isNotEmpty)
+                        TextButton(
+                          onPressed: _clearChatBackground,
+                          child: Text('清除',
+                              style:
+                                  TextStyle(color: Colors.red.shade400)),
+                        ),
+                    ],
+                  ),
+                  const Divider(height: 20),
+                  // 背景音乐
+                  Row(
+                    children: [
+                      Container(
+                        width: 44,
+                        height: 44,
+                        decoration: BoxDecoration(
+                          color: _bgColor,
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Icon(
+                          _bgmPath.isEmpty
+                              ? Icons.music_off_outlined
+                              : Icons.music_note,
+                          size: 20,
+                          color: _bgmPath.isEmpty
+                              ? Colors.grey.shade400
+                              : _qqBlue,
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text('背景音乐',
+                                style: TextStyle(
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w500)),
+                            Text(
+                              _bgmPath.isEmpty ? '未设置' : '循环播放中',
+                              style: TextStyle(
+                                  fontSize: 11,
+                                  color: Colors.grey.shade500),
+                            ),
+                          ],
+                        ),
+                      ),
+                      TextButton(
+                        onPressed: _isPickingBgm ? null : _pickBgm,
+                        child: Text(_isPickingBgm ? '选取中...' : '选择音乐'),
+                      ),
+                      if (_bgmPath.isNotEmpty)
+                        TextButton(
+                          onPressed: _clearBgm,
+                          child: Text('清除',
+                              style:
+                                  TextStyle(color: Colors.red.shade400)),
+                        ),
+                    ],
+                  ),
+                  if (_bgmPath.isNotEmpty) ...[
+                    const SizedBox(height: 4),
+                    Row(
+                      children: [
+                        Text('播放',
+                            style: TextStyle(
+                                fontSize: 12,
+                                color: Colors.grey.shade600)),
+                        Switch(
+                          value: _bgmEnabled,
+                          onChanged: _toggleBgm,
+                          activeThumbColor: _qqBlue,
+                        ),
+                        const SizedBox(width: 8),
+                        Icon(Icons.volume_down,
+                            size: 16, color: Colors.grey.shade500),
+                        Expanded(
+                          child: Slider(
+                            value: _bgmVolume,
+                            min: 0,
+                            max: 1,
+                            divisions: 20,
+                            activeColor: _qqBlue,
+                            onChanged: (v) =>
+                                setState(() => _bgmVolume = v),
+                            onChangeEnd: (v) =>
+                                AmbienceService.instance.setBgmVolume(v),
+                          ),
+                        ),
+                        Icon(Icons.volume_up,
+                            size: 16, color: Colors.grey.shade500),
+                      ],
+                    ),
+                  ],
+                ],
+              ),
+            ),
             const SizedBox(height: 24),
 
             // ── 断开连接（危险区域）────────────────────────────────
@@ -534,6 +910,64 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
               ),
             ),
             const SizedBox(height: 32),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 接入方式选项卡片（免费通道 / 高级通道）
+  Widget _buildProviderOption({
+    required String provider,
+    required IconData icon,
+    required String label,
+    required String subtitle,
+  }) {
+    final bool selected = _apiProvider == provider;
+    return GestureDetector(
+      onTap: () => setState(() {
+        _apiProvider = provider;
+        _apiTestResult = null;
+      }),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 150),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+        decoration: BoxDecoration(
+          color: selected ? const Color(0xFFE5F6FD) : _bgColor,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: selected ? _qqBlue : Colors.transparent,
+            width: 1.2,
+          ),
+        ),
+        child: Row(
+          children: [
+            Icon(icon,
+                size: 20,
+                color: selected ? _qqBlue : Colors.grey.shade500),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    label,
+                    style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                      color: selected ? _qqBlue : Colors.grey.shade800,
+                    ),
+                  ),
+                  Text(
+                    subtitle,
+                    style: TextStyle(
+                        fontSize: 10, color: Colors.grey.shade500),
+                  ),
+                ],
+              ),
+            ),
+            if (selected)
+              const Icon(Icons.check_circle, size: 16, color: _qqBlue),
           ],
         ),
       ),
@@ -766,6 +1200,7 @@ class _MemoryFactsDialogState extends State<_MemoryFactsDialog> {
                     separatorBuilder: (_, __) => const Divider(height: 1),
                     itemBuilder: (context, index) {
                       final fact = _facts[index];
+                      final factId = fact['id'] as int?;
                       final factType =
                           fact['fact_type'] as String? ?? 'other';
                       final content =
@@ -773,17 +1208,42 @@ class _MemoryFactsDialogState extends State<_MemoryFactsDialog> {
                       final score =
                           (fact['importance_score'] as num?)?.toDouble() ??
                               0.5;
-                      return ListTile(
-                        dense: true,
-                        leading: _factTypeIcon(factType),
-                        title: Text(content,
-                            style: const TextStyle(fontSize: 13)),
-                        trailing: _importanceIndicator(score),
+                      return Dismissible(
+                        key: ValueKey(factId ?? index),
+                        direction: DismissDirection.endToStart,
+                        background: Container(
+                          alignment: Alignment.centerRight,
+                          padding: const EdgeInsets.only(right: 16),
+                          color: Colors.red.shade400,
+                          child: const Icon(Icons.delete_outline,
+                              color: Colors.white, size: 20),
+                        ),
+                        onDismissed: (_) {
+                          setState(() => _facts.removeAt(index));
+                          if (factId != null) {
+                            DbHelper.instance.deleteMemoryFact(factId);
+                          }
+                        },
+                        child: ListTile(
+                          dense: true,
+                          leading: _factTypeIcon(factType),
+                          title: Text(content,
+                              style: const TextStyle(fontSize: 13)),
+                          trailing: _importanceIndicator(score),
+                        ),
                       );
                     },
                   ),
       ),
       actions: [
+        if (_facts.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(right: 8),
+            child: Text(
+              '左滑可删除碎片',
+              style: TextStyle(fontSize: 11, color: Colors.grey.shade400),
+            ),
+          ),
         TextButton(
           onPressed: () => Navigator.pop(context),
           child: const Text('关闭'),

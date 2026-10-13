@@ -1,5 +1,6 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:huainian/repositories/character_repository.dart';
+import 'package:huainian/services/ambience_service.dart';
 import 'package:huainian/services/import_service.dart';
 import 'package:huainian/services/llm_api_service.dart';
 import 'package:huainian/services/memory_distillation_service.dart';
@@ -21,6 +22,12 @@ final memoryDistillationServiceProvider =
     Provider<MemoryDistillationService>((ref) => MemoryDistillationService());
 final memoryRecallServiceProvider =
     Provider<MemoryRecallService>((ref) => MemoryRecallService());
+final ambienceServiceProvider =
+    Provider<AmbienceService>((ref) => AmbienceService.instance);
+
+/// V7.0 聊天背景图路径（null = 未设置；'' = 已清除）
+/// 设置页变更后写入，聊天页 watch 即时生效
+final chatBackgroundProvider = StateProvider<String?>((ref) => null);
 
 // ==========================================
 // 导入 + 性格提取流水线状态层
@@ -78,7 +85,7 @@ class ImportNotifier extends StateNotifier<ImportState> {
       previewText: '正在唤起系统文件管理器...',
     );
 
-    ({String analysisSlice, String fullText, int fileCount})? parsed;
+    ChatHistoryParseResult? parsed;
     try {
       parsed = await _importService.pickAndParseChatHistory();
     } catch (e) {
@@ -98,10 +105,13 @@ class ImportNotifier extends StateNotifier<ImportState> {
     final String fileCountHint = fileCount == 1
         ? '文件读取成功'
         : '$fileCount 份文件已合并';
+    final String sampledHint = parsed.isSampled
+        ? '\n检测到大型记录文件，已智能摘取前中后片段（共约 ${_formatChars(parsed.totalChars)} 字）'
+        : '';
 
     state = ImportState(
       phase: ImportPhase.extractingStyle,
-      previewText: '【$fileCountHint】正在分析 Ta 的说话方式...\n\n'
+      previewText: '【$fileCountHint】$sampledHint\n正在分析 Ta 的说话方式...\n\n'
           '(大模型思考需要时间，预计等待 1~4 分钟，请勿关闭应用)',
       validSlice: parsed.analysisSlice,
     );
@@ -126,6 +136,11 @@ class ImportNotifier extends StateNotifier<ImportState> {
         validSlice: parsed.analysisSlice,
       );
     }
+  }
+
+  static String _formatChars(int chars) {
+    if (chars < 10000) return '$chars';
+    return '${(chars / 10000).toStringAsFixed(1)}万';
   }
 
   static String _buildSuccessSummary(ExtractionResult r, int fileCount) {

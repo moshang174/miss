@@ -28,6 +28,12 @@ android {
 
     buildTypes {
         release {
+            // AGP 9 起 release 默认开启 R8 压缩混淆，会把 workmanager 内部
+            // Room 生成的 WorkDatabase_Impl 无参构造当作无用代码删除，
+            // 导致启动时 WorkManager 反射初始化失败、进程直接闪退。
+            // 显式关闭压缩混淆（本应用体积敏感的部分是 Flutter 引擎，与 dex 无关）。
+            isMinifyEnabled = false
+            isShrinkResources = false
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")

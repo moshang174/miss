@@ -26,6 +26,10 @@ dependencies:
   workmanager: ^0.9.0+3
   # 本地推送通知（阶段三 F-014 消息通知）
   flutter_local_notifications: ^17.2.4
+  # 背景音乐播放（V7.0 氛围设置）
+  audioplayers: ^6.1.0
+  # GBK 编码解码（V7.0 大文件导入兼容老QQ导出记录）
+  gbk_codec: ^0.4.0
 
 dev_dependencies:
   flutter_test:
@@ -34,3 +38,4 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+
